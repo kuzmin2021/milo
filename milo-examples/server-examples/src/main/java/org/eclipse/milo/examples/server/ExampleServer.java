@@ -10,6 +10,11 @@
 
 package org.eclipse.milo.examples.server;
 
+import static com.google.common.collect.Lists.newArrayList;
+import static org.eclipse.milo.opcua.sdk.server.api.config.OpcUaServerConfig.USER_TOKEN_POLICY_ANONYMOUS;
+import static org.eclipse.milo.opcua.sdk.server.api.config.OpcUaServerConfig.USER_TOKEN_POLICY_USERNAME;
+import static org.eclipse.milo.opcua.sdk.server.api.config.OpcUaServerConfig.USER_TOKEN_POLICY_X509;
+
 import java.io.File;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -48,22 +53,25 @@ import org.eclipse.milo.opcua.stack.core.util.SelfSignedCertificateGenerator;
 import org.eclipse.milo.opcua.stack.core.util.SelfSignedHttpsCertificateBuilder;
 import org.eclipse.milo.opcua.stack.server.EndpointConfiguration;
 import org.eclipse.milo.opcua.stack.server.security.DefaultServerCertificateValidator;
+import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
-import static com.google.common.collect.Lists.newArrayList;
-import static org.eclipse.milo.opcua.sdk.server.api.config.OpcUaServerConfig.USER_TOKEN_POLICY_ANONYMOUS;
-import static org.eclipse.milo.opcua.sdk.server.api.config.OpcUaServerConfig.USER_TOKEN_POLICY_USERNAME;
-import static org.eclipse.milo.opcua.sdk.server.api.config.OpcUaServerConfig.USER_TOKEN_POLICY_X509;
+import org.springframework.web.client.HttpClientErrorException;
+import org.thingsboard.rest.client.RestClient;
 
 public class ExampleServer {
 
-    private static final int TCP_BIND_PORT = 12686;
+    
+	private final Logger logger = LoggerFactory.getLogger(getClass());
+	
+	private static final int TCP_BIND_PORT = 12686;
     private static final int HTTPS_BIND_PORT = 8443;
+    private static String SERVER_URL = System.getenv("ATLAS_URL");
 
-    static {
+
+	static {
         // Required for SecurityPolicy.Aes256_Sha256_RsaPss
         Security.addProvider(new BouncyCastleProvider());
-
+       
         try {
             NonceUtil.blockUntilSecureRandomSeeded(10, TimeUnit.SECONDS);
         } catch (ExecutionException | InterruptedException | TimeoutException e) {
@@ -74,20 +82,19 @@ public class ExampleServer {
 
     public static void main(String[] args) throws Exception {
         ExampleServer server = new ExampleServer();
-
         server.startup().get();
-
         final CompletableFuture<Void> future = new CompletableFuture<>();
-
         Runtime.getRuntime().addShutdownHook(new Thread(() -> future.complete(null)));
-
         future.get();
     }
 
     private final OpcUaServer server;
     private final ExampleNamespace exampleNamespace;
+    private RestClient client = null;
 
-    public ExampleServer() throws Exception {
+
+
+	public ExampleServer() throws Exception {
         Path securityTempDir = Paths.get(System.getProperty("java.io.tmpdir"), "server", "security");
         Files.createDirectories(securityTempDir);
         if (!Files.exists(securityTempDir)) {
@@ -96,10 +103,8 @@ public class ExampleServer {
 
         File pkiDir = securityTempDir.resolve("pki").toFile();
 
-        LoggerFactory.getLogger(getClass())
-            .info("security dir: {}", securityTempDir.toAbsolutePath());
-        LoggerFactory.getLogger(getClass())
-            .info("security pki dir: {}", pkiDir.getAbsolutePath());
+        logger.info("security dir: {}", securityTempDir.toAbsolutePath());
+        logger.info("security pki dir: {}", pkiDir.getAbsolutePath());
 
         KeyStoreLoader loader = new KeyStoreLoader().load(securityTempDir);
 
@@ -110,8 +115,7 @@ public class ExampleServer {
 
         DefaultTrustListManager trustListManager = new DefaultTrustListManager(pkiDir);
 
-        DefaultServerCertificateValidator certificateValidator =
-            new DefaultServerCertificateValidator(trustListManager);
+        DefaultServerCertificateValidator certificateValidator = new DefaultServerCertificateValidator(trustListManager);
 
         KeyPair httpsKeyPair = SelfSignedCertificateGenerator.generateRsaKeyPair(2048);
 
@@ -121,15 +125,21 @@ public class ExampleServer {
         X509Certificate httpsCertificate = httpsCertificateBuilder.build();
 
         UsernameIdentityValidator identityValidator = new UsernameIdentityValidator(
-            true,
-            authChallenge -> {
-                String username = authChallenge.getUsername();
-                String password = authChallenge.getPassword();
-
-                boolean userOk = "user".equals(username) && "password1".equals(password);
-                boolean adminOk = "admin".equals(username) && "password2".equals(password);
-
-                return userOk || adminOk;
+            false,
+            authChallenge -> {            	
+            	LoggerFactory.getLogger(getClass()).info(System.getenv("ATLAS_URL"));     
+            	
+            	try {
+            		client = new RestClient(SERVER_URL);
+            		client.login(authChallenge.getUsername(), authChallenge.getPassword());
+            		
+            		LoggerFactory.getLogger(getClass()).info("User authorization: "+ client.getUser().get().getName() + ". Access granted.");            		
+    				return true;
+            	}catch (HttpClientErrorException e) {
+        			e.printStackTrace();
+        			LoggerFactory.getLogger(getClass()).info("User authorization: "+ client.getUser().get().getName() + ". Access denied.");
+        			return false;
+        		}           	
             }
         );
 
@@ -152,13 +162,13 @@ public class ExampleServer {
 
         OpcUaServerConfig serverConfig = OpcUaServerConfig.builder()
             .setApplicationUri(applicationUri)
-            .setApplicationName(LocalizedText.english("Eclipse Milo OPC UA Example Server"))
+            .setApplicationName(LocalizedText.english("Eclipse Milo OPC UA Server"))
             .setEndpoints(endpointConfigurations)
             .setBuildInfo(
                 new BuildInfo(
-                    "urn:eclipse:milo:example-server",
+                    "urn:eclipse:milo:opcserver",
                     "eclipse",
-                    "eclipse milo example server",
+                    "eclipse milo server",
                     OpcUaServer.SDK_VERSION,
                     "", DateTime.now()))
             .setCertificateManager(certificateManager)
@@ -167,11 +177,11 @@ public class ExampleServer {
             .setHttpsKeyPair(httpsKeyPair)
             .setHttpsCertificateChain(new X509Certificate[]{httpsCertificate})
             .setIdentityValidator(new CompositeValidator(identityValidator, x509IdentityValidator))
-            .setProductUri("urn:eclipse:milo:example-server")
-            .build();
-
+            .setProductUri("urn:eclipse:milo:opcserver")              
+            .build();       
+        
         server = new OpcUaServer(serverConfig);
-
+        
         exampleNamespace = new ExampleNamespace(server);
         exampleNamespace.startup();
     }
